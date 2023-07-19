@@ -1,0 +1,203 @@
+diff --git a/aten/src/ATen/CheckpointTensorImpl.cpp b/aten/src/ATen/CheckpointTensorImpl.cpp
+index 7c29fdc2f0a..d816d8024e1 100644
+--- a/aten/src/ATen/CheckpointTensorImpl.cpp
++++ b/aten/src/ATen/CheckpointTensorImpl.cpp
+@@ -1,6 +1,6 @@
+ #include <ATen/CheckpointTensorImpl.h>
+ #include <ATen/Logger.h>
+-#include <c10/cuda/CUDACachingAllocator.h>
++//#include <c10/cuda/CUDACachingAllocator.h>
+ 
+ #include <chrono>
+ #include <string>
+@@ -141,9 +141,10 @@ void CheckpointPool::add(const intrusive_ptr<AliasPool>& p) {
+ }
+ 
+ long current_memory() {
+-  STATS.track("current_memory");
+-  auto device_stat = c10::cuda::CUDACachingAllocator::getDeviceStats(0);
+-  return device_stat.allocated_bytes[0].current;
++  return 1e10;
++  //STATS.track("current_memory");
++  //auto device_stat = c10::cuda::CUDACachingAllocator::getDeviceStats(0);
++  //return device_stat.allocated_bytes[0].current;
+ }
+ 
+ void CheckpointPool::auto_evict() {
+diff --git a/aten/src/ATen/CheckpointTensorImpl.h b/aten/src/ATen/CheckpointTensorImpl.h
+index b1edbf2c800..a468f6182a0 100644
+--- a/aten/src/ATen/CheckpointTensorImpl.h
++++ b/aten/src/ATen/CheckpointTensorImpl.h
+@@ -427,6 +427,7 @@ struct CheckpointTensorImpl : TensorImpl {
+     return ref->value->value->get().size(d);
+   }
+   IntArrayRef strides() const override {
++    std::cout << "forwarding strides" << std::endl;
+     return ref->value->value->get().strides();
+   }
+   int64_t stride(int64_t d) const override {
+@@ -435,6 +436,9 @@ struct CheckpointTensorImpl : TensorImpl {
+   bool has_storage() const override {
+     return false;
+   }
++  //bool is_contiguous(at::MemoryFormat memory_format) const override {
++  //  return ref->value->value->get().is_contiguous(memory_format);
++  //}
+ };
+ 
+ // CheckpointPool keep a list of AliasPool, and search over them to choose the best one to evict.
+diff --git a/aten/src/ATen/native/Checkpoint.cpp b/aten/src/ATen/native/Checkpoint.cpp
+index d6e01b9ffc1..36181cba4c6 100644
+--- a/aten/src/ATen/native/Checkpoint.cpp
++++ b/aten/src/ATen/native/Checkpoint.cpp
+@@ -36,6 +36,25 @@ Tensor& checkpoint_add_(Tensor& a, const Tensor& b, Scalar c) {
+   return a;
+ }
+ 
++Tensor checkpoint_transpose(const Tensor& a, long b, long c) {
++  std::cout << "tranpose" << std::endl;
++  rematerialize_function_t rt =
++    [=](const Tensors& vec) -> Tensors {
++      return {at::transpose(vec.at(0), b, c)};
++    };
++  return CheckpointTensorImpl::make("transpose", rt, {a})[0];
++}
++
++Tensor& checkpoint_transpose_(at::Tensor& a, long b, long c) {
++  std::cout << "tranpose_" << std::endl;
++  mutate_function_t mt =
++    [=](const Tensors& vec) {
++      vec.at(0).transpose_(b, c);
++    };
++  CheckpointTensorImpl::mutate("transpose_", mt, {a}, {0});
++  return a;
++}
++
+ Tensor checkpoint_mul(at::Tensor const& a, at::Tensor const& b) {
+   rematerialize_function_t rt =
+     [=](const Tensors& vec) -> Tensors {
+@@ -1244,6 +1263,15 @@ Tensor checkpoint_bmm(const Tensor& self, const Tensor& mat2) {
+   return CheckpointTensorImpl::make("bmm", rt, {self, mat2})[0];
+ }
+ 
++Tensor checkpoint_contiguous(const Tensor& self, MemoryFormat memory_format) {
++  std::cout << "rerouting" << std::endl;
++  rematerialize_function_t rt =
++    [=](const Tensors& vec) -> Tensors {
++    return {contiguous(vec.at(0))};
++  };
++  return CheckpointTensorImpl::make("contiguous", rt, {self})[0];
++}
++
+ Tensor checkpoint__softmax(const Tensor& self, long dim, bool half_to_float) {
+   rematerialize_function_t rt =
+     [=](const Tensors& vec) -> Tensors {
+diff --git a/aten/src/ATen/native/TensorProperties.cpp b/aten/src/ATen/native/TensorProperties.cpp
+index 48dab43b2dc..5e2633c75f1 100644
+--- a/aten/src/ATen/native/TensorProperties.cpp
++++ b/aten/src/ATen/native/TensorProperties.cpp
+@@ -4,7 +4,7 @@
+ #include <ATen/detail/CUDAHooksInterface.h>
+ #include <ATen/NamedTensorUtils.h>
+ #include <torch/library.h>
+-
++#include <csignal>
+ #include <ATen/Config.h>
+ namespace at {
+ namespace native {
+@@ -68,7 +68,14 @@ Tensor contiguous(const Tensor & self) {
+   return contiguous(self, MemoryFormat::Contiguous);
+ }
+ 
++Tensor checkpoint_contiguous(const Tensor& self, MemoryFormat memory_format);
++
+ Tensor contiguous(const Tensor& self, MemoryFormat memory_format) {
++  //std::raise(SIGINT);
++  std::cout << "entering" << std::endl;
++  if (self.is_checkpoint()) {
++    return checkpoint_contiguous(self, memory_format);
++  }
+   if (self.is_contiguous(memory_format)) {
+     return self;
+   }
+diff --git a/aten/src/ATen/native/native_functions.yaml b/aten/src/ATen/native/native_functions.yaml
+index 6d54e1cc9cb..d5bae955dc3 100644
+--- a/aten/src/ATen/native/native_functions.yaml
++++ b/aten/src/ATen/native/native_functions.yaml
+@@ -3426,6 +3426,10 @@
+   use_c10_dispatcher: full
+   variants: function, method
+   device_guard: False
++  dispatch:
++    CPU: transpose
++    CUDA: transpose
++    Checkpoint: checkpoint_transpose
+ 
+ - func: transpose.Dimname(Tensor(a) self, Dimname dim0, Dimname dim1) -> Tensor(a)
+   variants: function, method
+@@ -3441,6 +3445,10 @@
+   use_c10_dispatcher: full
+   variants: method
+   device_guard: False
++  dispatch:
++    CPU: transpose_
++    CUDA: transpose_
++    Checkpoint: checkpoint_transpose_
+ 
+ - func: _mkldnn_transpose_(Tensor(a!) self, int dim0, int dim1) -> Tensor(a!)
+   use_c10_dispatcher: full
+diff --git a/setup.py b/setup.py
+index 8c060a1c5e3..a908c411a5f 100644
+--- a/setup.py
++++ b/setup.py
+@@ -174,7 +174,7 @@ if sys.platform == 'win32' and sys.maxsize.bit_length() == 31:
+ import platform
+ python_min_version = (3, 6, 1)
+ python_min_version_str = '.'.join((str(num) for num in python_min_version))
+-python_max_version = (3, 9, 0)
++python_max_version = (3, 11, 0)
+ python_max_version_str = '.'.join((str(num) for num in python_max_version))
+ if sys.version_info < python_min_version or sys.version_info >= python_max_version:
+     print("You are using Python {}. Python >={},<{} is required.".format(platform.python_version(),
+diff --git a/tools/autograd/templates/python_variable_methods.cpp b/tools/autograd/templates/python_variable_methods.cpp
+index ba4327068bc..398b80522f9 100644
+--- a/tools/autograd/templates/python_variable_methods.cpp
++++ b/tools/autograd/templates/python_variable_methods.cpp
+@@ -239,8 +239,12 @@ static PyObject * THPVariable_contiguous(PyObject* self, PyObject* args, PyObjec
+ 
+   auto& self_ = reinterpret_cast<THPVariable*>(self)->cdata;
+   auto memory_format = r.memoryformat(0);
++  std::cout << "THPVC" << std::endl;
++  if (self_.is_checkpoint()) {
++    std::cout << "CATCH" << std::endl;
++  }
+   // avoids touching the GIL or current device if self is already contiguous
+-  if (self_.is_contiguous(memory_format)) {
++  if (self_.is_contiguous(memory_format) && !self_.is_checkpoint()) {
+     // NOTE: this logic is duplicated from VariableType.cpp. Since we need to
+     // record this call to contiguous() in the trace regardless of whether
+     // we actually call contiguous here, we need to record this information
+diff --git a/torch/_tensor_str.py b/torch/_tensor_str.py
+index 8146ea6be20..fa71209eef6 100644
+--- a/torch/_tensor_str.py
++++ b/torch/_tensor_str.py
+@@ -218,6 +218,7 @@ def _tensor_str_with_formatter(self, indent, summarize, formatter1, formatter2=N
+     return '[' + tensor_str + ']'
+ 
+ def _tensor_str(self, indent):
++    self = self.decheckpoint()
+     if self.numel() == 0:
+         return '[]'
+ 
+diff --git a/torch/tensor.py b/torch/tensor.py
+index 880b8d13020..ef7046e0a18 100644
+--- a/torch/tensor.py
++++ b/torch/tensor.py
+@@ -705,6 +705,7 @@ class Tensor(torch._C._TensorBase):
+         itemsize = self.storage().element_size()
+ 
+         shape = tuple(self.shape)
++        print("here")
+         if self.is_contiguous():
+             # __cuda_array_interface__ v2 requires the strides to be omitted
+             # (either not set or set to None) for C-contiguous arrays.
